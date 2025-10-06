@@ -6,9 +6,9 @@
 .DESCRIPTION
     This script is designed to run as a timer-triggered Azure Function. It uses the Function App's Managed Identity
     to connect to Azure, retrieve the NAS CD API Token from an Azure Key Vault, and discover Storage Accounts
-    across all accessible subscriptions. It checks if a system already exists in NAS CD before attempting to add it.
+    across all accessible subscriptions. It automatically detects and uses private endpoints for Azure Files where available.
+    It checks if a system already exists in NAS CD before attempting to add it.
     It will only register accounts that contain one or more Azure File Shares. Configuration is read from Application Settings.
-    All eligible accounts are registered using the 'system-type-azurefiles' system type.
 
 .NOTES
     This script relies on Application Settings within the Azure Function App for configuration:
@@ -20,12 +20,17 @@
     The Function App's System-Assigned Managed Identity requires the following IAM role assignments:
 
     Scoped to each Subscription to be scanned:
-    1. Reader: Allows the function to list subscriptions and storage accounts.
+    1. Reader: Allows the function to list subscriptions, storage accounts, and private endpoints.
     2. Storage Account Key Operator Service Role: Allows the function to retrieve access keys for storage accounts.
     3. Storage File Data SMB Share Reader: Allows the function to list file shares within a storage account.
 
     Scoped to the Azure Key Vault resource:
     1. Key Vault Secrets User: Allows the function to read the NAS CD API token secret from the vault.
+
+    NETWORKING PREREQUISITE FOR PRIVATE ENDPOINTS:
+    For the script to successfully connect to and list shares on a storage account via a private endpoint,
+    the Azure Function App MUST be configured with VNet Integration. The selected VNet must have DNS
+    resolution for the private DNS zone associated with the storage account's privatelink.
 #>
 # Input bindings are passed in via param block.
 param($Timer)
@@ -222,21 +227,30 @@ foreach ($subscription in $subscriptions) {
             Write-Verbose "Processing storage account: $($account.StorageAccountName)"
             $accessKeySecure = $null
             $nasCdStatus = "Not Attempted"
-            $fileServiceUrl = $null
-            $fileServiceHostName = $null
             $hasFileShares = $false
-            
             $nasCdSystemType = "system-type-azurefiles"
+            $endpointType = "Public"
+            $fileServiceHostName = $null
 
+            # Determine the endpoint FQDN (Private or Public)
             try {
-                $fileServiceUrl = $account.PrimaryEndpoints.File
-                if ($fileServiceUrl) {
-                    $fileServiceHostName = ([System.Uri]$fileServiceUrl).Host
+                $privateEndpoint = Get-AzPrivateEndpoint -ResourceGroupName $account.ResourceGroupName | Where-Object { 
+                    $_.PrivateLinkServiceConnections.PrivateLinkServiceId -eq $account.Id -and $_.PrivateLinkServiceConnections.GroupIds -contains 'file' 
                 }
+
+                if ($privateEndpoint -and $privateEndpoint.CustomDnsConfigs.Fqdn) {
+                    $fileServiceHostName = $privateEndpoint[0].CustomDnsConfigs.Fqdn[0]
+                    $endpointType = "Private"
+                    Write-Information "  - Detected Private Endpoint: $fileServiceHostName"
+                } else {
+                    $fileServiceHostName = ([System.Uri]$account.PrimaryEndpoints.File).Host
+                    Write-Verbose "  - No private endpoint found for file service, using public endpoint: $fileServiceHostName"
+                }
+            } catch {
+                 Write-Warning "Could not determine endpoint for account '$($account.StorageAccountName)'. Full Error: $($_.Exception.Message)"
+                 $fileServiceHostName = ([System.Uri]$account.PrimaryEndpoints.File).Host
             }
-            catch {
-                Write-Warning "Could not parse File Service URL for account '$($account.StorageAccountName)'."
-            }
+            
 
             # If we don't have a hostname, we can't continue with this account
             if (-not $fileServiceHostName) {
@@ -287,8 +301,7 @@ foreach ($subscription in $subscriptions) {
             $results.Add([PSCustomObject]@{
                 SubscriptionName     = $subscription.Name
                 StorageAccountName   = $account.StorageAccountName
-                SystemTypeRegistered = $nasCdSystemType
-                FileServiceUrl       = $fileServiceUrl
+                EndpointType         = $endpointType
                 FileServiceHost      = $fileServiceHostName
                 NasCdRegistration    = $nasCdStatus
             })
@@ -302,7 +315,7 @@ foreach ($subscription in $subscriptions) {
 
 Write-Information "`n--- Script Execution Summary ---"
 if ($results.Count -gt 0) {
-    $results | Format-Table | Out-String | Write-Information
+    $results | Format-Table -Property SubscriptionName, StorageAccountName, EndpointType, FileServiceHost, NasCdRegistration | Out-String | Write-Information
 }
 else {
     Write-Information "No storage account information was collected."
