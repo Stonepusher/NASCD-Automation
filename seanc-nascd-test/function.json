@@ -4,7 +4,8 @@
       "name": "Timer",
       "type": "timerTrigger",
       "direction": "in",
-      "schedule": "0 * * * * *"
+      "schedule": "0 */10 * * * *"
     }
   ]
 }
+
